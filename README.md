@@ -19,8 +19,16 @@ This would not have any impact on the time-of-use calculations, but it
 might have a small impact on the totals for tiered usage, especially
 in billing periods that span the winter/summer cutover.
 
+Type:
+
+    PS> Get-Help .\Analyze-ElectricalRate.ps1 -Full
+
+to get detailed help on the options supported by the script along with
+some usage examples.
+
 ## GETTING YOUR DATA
 
+### Hydro Ottawa
 You can download your hourly usage data from Hydro Ottawa by signing
 into your account, then clicking on the "Billing" tab, and then at
 the top of the screen under the "Usage" menu selecting "Download My Data".
@@ -35,6 +43,14 @@ otherwise the calculations for the tiered rate may end up being incorrect.
 You can convert the downloaded Excel file to a CSV file for free at
 https://cloudconvert.com/. The resulting file can be used directly by
 this script.
+
+### Enova (Kitchener/Waterloo area)
+Enova allows you to export your data as a CSV, but appears to only give access
+to the last 90 days. Log in and navigate to the "Electricity Use" section
+of the web site. Set a date range and then click on the "Refresh Chart" button.
+
+Under the chart showing the total usage you should see a "Download Consumption
+History" button - click on it to download a CSV file.
 
 ## Sample Output
 

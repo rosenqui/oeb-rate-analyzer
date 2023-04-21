@@ -1,5 +1,5 @@
 <#PSScriptInfo
-.VERSION 2023.4.18.1144
+.VERSION 2023.4.21.1720
 .GUID 6671c61e-aac0-46d6-a6ee-5d588d246df9
 .AUTHOR rosenqui
 .COPYRIGHT
@@ -34,25 +34,8 @@ This would not have any impact on the time-of-use calculations, but
 might have a small impact on the totals for tiered usage, especially
 in billing periods that span the winter/summer cutover.
 
-GETTING YOUR DATA
------------------
-You can download your hourly usage data from Hydro Ottawa by signing
-into your account, then clicking on the "Billing" tab, and then at
-the top of the screen under the "Usage" menu selecting "Download My Data".
-
-Select "Hourly" and then click on "Change Date" and specify Jan 1 2022
-as the "From" date and Dec 31 2022 as the "To" date. Click the "Submit"
-button to set the date range, then click on the green Microsoft Excel
-icon to export your data as an Excel file. You don't need to select a
-full year's worth of data, but it's important to include full months,
-otherwise the calculations for the tiered rate may end up being incorrect.
-
-You can convert the downloaded Excel file to a CSV file for free at
-https://cloudconvert.com/. The resulting file can be used directly by
-this script.
-
 .EXAMPLE
-Analyze-ElectricalRate.ps1 -UsageCSV 2022-hourly.csv | Format-Table -AutoSize *
+Analyze-ElectricalRate.ps1 -HydroOttawaCSV 2022-hourly.csv | Format-Table -AutoSize *
 
 Computes the cost of each rate plan based on your 2022 usage data, aggregating
 it by month and showing you which plan is the best for each month of the year.
@@ -77,7 +60,7 @@ The output contains the following columns:
  Best - which of the three rate plans is the cheapest for the month
 
 .EXAMPLE
-Analyze-ElectricalRate.ps1 -UsageCSV 2022-hourly.csv -RawValues | Out-GridView
+Analyze-ElectricalRate.ps1 -HydroOttawaCSV 2022-hourly.csv -RawValues | Out-GridView
 
 Augments the hour-by-hour data with per-tier values and then displays the
 results in a GridView window. Use the -RawValues option to check that each
@@ -88,7 +71,7 @@ holiday and the time-of-use rate plan.
 [CmdletBinding()]
 [OutputType([pscustomobject])]
 Param (
-    # A CSV file giving hourly kWh usage in 3 columns:
+    # A CSV file from Hydro Ottawa giving hourly kWh usage in 3 columns:
     #  1) the date (ex. 2022-05-24 or 05/24/2022)
     #  2) the time of day at the start of the usage period. This should be an hour without any minutes, ex. 1:00 PM or 13:00
     #  3) the kWh usage for that hour
@@ -96,8 +79,46 @@ Param (
     # The first two columns are combined and then parsed by the .NET DateTime::Parse method
     # (see https://learn.microsoft.com/en-us/dotnet/api/system.datetime.parse?view=netframework-4.8.1),
     # so they must combine to make a date+time format that .NET can parse.
-    [Parameter(Mandatory = $true, Position = 0)]
-    [string] $UsageCSV,
+    # 
+    # GETTING YOUR DATA
+    # -----------------
+    # You can download your hourly usage data from Hydro Ottawa by signing
+    # into your account, then clicking on the "Billing" tab, and then at
+    # the top of the screen under the "Usage" menu selecting "Download My Data".
+    # 
+    # Select "Hourly" and then click on "Change Date" and specify Jan 1 2022
+    # as the "From" date and Dec 31 2022 as the "To" date. Click the "Submit"
+    # button to set the date range, then click on the green Microsoft Excel
+    # icon to export your data as an Excel file. You don't need to select a
+    # full year's worth of data, but it's important to include full months,
+    # otherwise the calculations for the tiered rate may end up being incorrect.
+    # 
+    # You can convert the downloaded Excel file to a CSV file for free at
+    # https://cloudconvert.com/. The resulting file can be used directly by
+    # this script.
+    
+    [Parameter(Mandatory, Position = 0, ParameterSetName = 'HydroOttawa')]
+    [string] $HydroOttawaCSV,
+
+    # A CSV file from Enova giving hourly kWh usage in 28 columns:
+    #  1) the date (ex. 2022-05-24 or 05/24/2022)
+    #  2) the kWh usage from 00:00 up to 01:00
+    #  3) the kWh usage from 01:00 up to 02:00
+    #  4) the kWh usage from 02:00 up to 03:00
+    #  ...
+    #  25) the kWh usage from 23:00 up to 00:00
+    #  26) the total on-peak kWh usage for the day
+    #  27) the total mid-peak kWh usage for the day
+    #  28) the total off-peak kWh usage for the day
+    [Parameter(Mandatory, Position = 0, ParameterSetName = 'Enova')]
+    [string] $EnovaCSV,
+
+    # Usage data piped in as a custom object containing two fields:
+    #   Date - the date of the usage including the hour of the day.
+    #          Only the hour portion of the timestamp is used.
+    #   kWh - the electrical usage for the time slot.
+    [Parameter(Mandatory, ValueFromPipeline, ParameterSetName = 'Pipeline')]
+    [pscustomobject] $Data,
 
     # If specified, show the computed values for each hour and don't roll
     # them up into monthly totals. This skips the analysis step, but lets you
@@ -112,6 +133,7 @@ Begin {
         2022 = @(3, 52, 105, 143, 182, 213, 248, 283, 359, 360);
         2023 = @(2, 51, 97, 142, 184, 219, 247, 282, 359, 360);
     };
+    $HOURS = 0..23;
 
     $MID_PEAK = 'MidPeak';
     $OFF_PEAK = 'OffPeak';
@@ -133,7 +155,51 @@ Begin {
     $UloMidPeakRate = $MidPeakRate;
     $UloOnPeakRate = 0.24;
 
-    function ComputeTieredRate($obj) {
+    # An array that gets appended to for each object piped into us
+    $categorizedData = New-Object -TypeName System.Collections.ArrayList;
+
+    function CategorizeTimes {
+        [CmdletBinding()]
+        [OutputType([pscustomobject])]
+        param (
+            [Parameter(Mandatory, ValueFromPipelineByPropertyName)]
+            [datetime] $Date,
+            [Parameter(Mandatory = $false, ValueFromPipelineByPropertyName)]
+            [datetime] $Time,
+            [Parameter(Mandatory, ValueFromPipelineByPropertyName)]
+            [double] $kWh
+        )
+
+        Process {
+            if ($Time) {
+                $d = [datetime]::new($Date.Year, $Date.Month, $Date.Day, $Time.Hour, 0, 0, [System.DateTimeKind]::Local);
+            } else {
+                $d = $Date;
+            }
+
+            [PSCustomObject]@{
+                Date = $d;
+                kWh = $kWh;
+
+                Month = $d.Month;
+                DayOfWeek = $d.DayOfWeek;
+                Hour = $d.Hour;
+                IsHoliday = IsHoliday($d);
+                IsWeekend = $d.DayOfWeek -eq 'Saturday' -or $d.DayOfWeek -eq 'Sunday';
+                IsWinter = $d.Month -ge 11 -or $d.Month -le 4;
+
+                Tou = 0.0;
+                TouRate = 0.0;
+                TouKind = '';
+
+                Ulo = 0.0;
+                UloRate = 0.0;
+                UloKind = '';
+            }
+        }
+    }
+
+    function ComputeTieredRate([pscustomobject] $obj) {
         if ($obj.IsWinter) {
             $threshold = $Tier2WinterThreshold;
         } else {
@@ -158,59 +224,129 @@ Begin {
         $obj.Tiered = $t1 + $t2;
     }
 
-    function ComputeTouRate($obj) {
-        $rate = 0;
-        $kind = '';
+    function ComputeTouRate {
+        [CmdletBinding()]
+        [OutputType([pscustomobject])]
+        param (
+            [Parameter(Mandatory, ValueFromPipeline)]
+            [pscustomobject] $obj
+        )
 
-        if ($obj.IsWeekend -or $obj.IsHoliday) {
-            $rate = $OffPeakRate;
-            $kind = $OFF_PEAK;
-        } elseif ($obj.Hour -ge 19 -or $obj.Hour -lt 7) {
-            $rate = $OffPeakRate;
-            $kind = $OFF_PEAK;
-        } elseif ($obj.Hour -ge 11 -and $obj.Hour -lt 17) {
-            if ($obj.IsWinter) {
-                $rate = $MidPeakRate;
-                $kind = $MID_PEAK;
+        Process {
+            $rate = 0;
+            $kind = '';
+
+            if ($obj.IsWeekend -or $obj.IsHoliday) {
+                $rate = $OffPeakRate;
+                $kind = $OFF_PEAK;
+            } elseif ($obj.Hour -ge 19 -or $obj.Hour -lt 7) {
+                $rate = $OffPeakRate;
+                $kind = $OFF_PEAK;
+            } elseif ($obj.Hour -ge 11 -and $obj.Hour -lt 17) {
+                if ($obj.IsWinter) {
+                    $rate = $MidPeakRate;
+                    $kind = $MID_PEAK;
+                } else {
+                    $rate = $OnPeakRate;
+                    $kind = $ON_PEAK;
+                }
             } else {
-                $rate = $OnPeakRate;
-                $kind = $ON_PEAK;
+                # We're in the 7-11AM and 5-7PM range
+                if ($obj.IsWinter) {
+                    $rate = $OnPeakRate;
+                    $kind = $ON_PEAK;
+                } else {
+                    $rate = $MidPeakRate;
+                    $kind = $MID_PEAK;
+                }
             }
-        } else {
-            # We're in the 7-11AM and 5-7PM range
-            if ($obj.IsWinter) {
-                $rate = $OnPeakRate;
-                $kind = $ON_PEAK;
-            } else {
-                $rate = $MidPeakRate;
-                $kind = $MID_PEAK;
-            }
+            $obj.Tou = $obj.kWh * $rate;
+            $obj.TouRate = $rate;
+            $obj.TouKind = $kind;
+
+            $obj;
         }
-        $obj.Tou = $obj.kWh * $rate;
-        $obj.TouRate = $rate;
-        $obj.TouKind = $kind;
     }
 
-    function ComputeUloRate($obj) {
-        $rate = 0;
-        $kind = '';
+    function ComputeUloRate {
+        [CmdletBinding()]
+        [OutputType([pscustomobject])]
+        param (
+            [Parameter(Mandatory, ValueFromPipeline)]
+            [pscustomobject] $obj
+        )
 
-        if ($obj.Hour -ge 23 -or $obj.Hour -lt 7) {
-            $rate = $UloRate;
-            $kind = $ULO;
-        } elseif ($obj.IsWeekend -or $obj.IsHoliday) {
-            $rate = $UloOffPeakRate;
-            $kind = $OFF_PEAK;
-        } elseif ($obj.Hour -ge 16 -and $obj.Hour -lt 21) {
-            $rate = $UloOnPeakRate;
-            $kind = $ULO_PEAK;
-        } else {
-            $rate = $UloMidPeakRate;
-            $kind = $MID_PEAK;
+        Process {
+            $rate = 0;
+            $kind = '';
+
+            if ($obj.Hour -ge 23 -or $obj.Hour -lt 7) {
+                $rate = $UloRate;
+                $kind = $ULO;
+            } elseif ($obj.IsWeekend -or $obj.IsHoliday) {
+                $rate = $UloOffPeakRate;
+                $kind = $OFF_PEAK;
+            } elseif ($obj.Hour -ge 16 -and $obj.Hour -lt 21) {
+                $rate = $UloOnPeakRate;
+                $kind = $ULO_PEAK;
+            } else {
+                $rate = $UloMidPeakRate;
+                $kind = $MID_PEAK;
+            }
+            $obj.Ulo = $obj.kWh * $rate;
+            $obj.UloRate = $rate;
+            $obj.UloKind = $kind;
+
+            $obj;
         }
-        $obj.Ulo = $obj.kWh * $rate;
-        $obj.UloRate = $rate;
-        $obj.UloKind = $kind;
+    }
+
+    function ConvertEnova {
+        [CmdletBinding()]
+        [OutputType([pscustomobject])]
+        Param (
+            [Parameter(Mandatory, ValueFromPipeline)]
+            [pscustomobject] $Obj
+        )
+
+        Process {
+            if ($Obj.Date.Length -eq 10) {
+                foreach ($hour in $HOURS) {
+                    [PSCustomObject]@{
+                        Date = $Obj.Date;
+                        Time = $hour.ToString("D2") + ":00:00";
+                        kWh = $Obj.$hour;
+                    }      
+                }
+            }
+        }
+        
+    }
+
+    function ConvertHydroOttawa {
+        [CmdletBinding()]
+        [OutputType([pscustomobject])]
+        param (
+            [Parameter(Mandatory = $false, ValueFromPipelineByPropertyName)]
+            [string] $Date,
+            [Parameter(Mandatory = $false, ValueFromPipelineByPropertyName)]
+            [string] $Time,
+            [Parameter(Mandatory = $false, ValueFromPipelineByPropertyName)]
+            [string] $kWh
+        )
+
+        Begin {
+            $dt = New-Object datetime;
+        }
+
+        Process {
+            if ($Date -and $Time -and $kWh -and [datetime]::TryParse($Date + ' ' + $Time, [ref]$dt)) {
+                [PSCustomObject]@{
+                    Date = $dt;
+                    kWh = [double]$kWh;
+                }
+            }
+        }
     }
 
     function IsHoliday([datetime]$dt) {
@@ -226,45 +362,38 @@ Begin {
     }
 }
 
+Process {
+    if ($Data) {
+        $d = $Data | CategorizeTimes | ComputeTouRate | ComputeUloRate;
+
+        if ($RawValues) {
+            $d;
+        } else {
+            $categorizedData.Add($d) > $null;
+        }
+    }
+}
+
 End {
-    $dt = New-Object datetime;
+    if ($HydroOttawaCSV) {
+        $categorizedData = Get-Content -Path $HydroOttawaCSV | ConvertFrom-CSV -Delimiter ',' -Header Date, Time, kWh | ConvertHydroOttawa |
+            CategorizeTimes | ComputeTouRate | ComputeUloRate;
+    } elseif ($EnovaCSV) {
+        $header = @('Date') + ($HOURS | ForEach-Object { $_.ToString(); } ) + @('Peak', 'Mid', 'Off');
 
-    $data =
-        Get-Content -Path $UsageCSV |
-        ConvertFrom-CSV -Delimiter ',' -Header Date, Time, kWh |
-        Foreach-Object {
-            if ([datetime]::TryParse($_.Date + ' ' + $_.Time, [ref]$dt)) {
-                [PSCustomObject]@{
-                    Date = $dt;
-                    kWh = [double]$_.kWh;
-
-                    Month = $dt.Month;
-                    DayOfWeek = $dt.DayOfWeek;
-                    Hour = $dt.Hour;
-                    IsHoliday = IsHoliday($dt);
-                    IsWeekend = $dt.DayOfWeek -eq 'Saturday' -or $dt.DayOfWeek -eq 'Sunday';
-                    IsWinter = $dt.Month -ge 11 -or $dt.Month -le 4;
-
-                    Tou = 0.0;
-                    TouRate = 0.0;
-                    TouKind = '';
-
-                    Ulo = 0.0;
-                    UloRate = 0.0;
-                    UloKind = '';
-                }
-            }
-        } |
-        Foreach-Object {
-            ComputeTouRate($_);
-            ComputeUloRate($_);
-            $_;
-        };
+        $categorizedData = Get-Content -Path $EnovaCSV | ConvertFrom-Csv -Delimiter ',' -Header $header | ConvertEnova |
+            CategorizeTimes | ComputeTouRate | ComputeUloRate;
+    } else {
+        # Pipeline usage - $categorizedData should be populated
+        if ($RawValues) {
+            return; # We output the categorized data in the Process block
+        }
+    }
 
     if ($RawValues) {
-        $data;
+        $categorizedData;
     } else {
-        $data |
+        $categorizedData |
         Group-Object -Property Month |
         ForEach-Object {
             $obj = [PSCustomObject]@{
